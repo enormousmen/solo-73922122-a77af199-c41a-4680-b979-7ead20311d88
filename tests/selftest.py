@@ -19,6 +19,28 @@ def check(name, ok, detail=""):
 PENDING_RESULTS = {"shadow_pending", "shadow_completed_primary_incomplete", "pending"}
 
 
+async def get_diag(s):
+    return await (await s.get(f"{GW}/api/diag/quote-big")).json()
+
+
+def find_diag(payload, marker):
+    for d in payload["active"] + payload["done"]:
+        if marker in d["target"]:
+            return d
+    return None
+
+
+async def wait_diag(s, marker, timeout_s=8.0):
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        payload = await get_diag(s)
+        d = find_diag(payload, marker)
+        if d is not None and d["ended"]:
+            return d, payload
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"finalized diag with {marker} not found")
+
+
 async def wait_record(s, gw, marker, timeout_s=5.0):
     """按 marker 轮询等待对应比对记录到达终态后返回。"""
     deadline = asyncio.get_event_loop().time() + timeout_s
@@ -134,6 +156,150 @@ async def main():
               disc[0]["result"] if disc else "")
         check("7 断连后影子名额归零", state["shadow_in_flight"] == 0,
               str(state["shadow_in_flight"]))
+
+        # 8. /quote-big 诊断: 在途阶段可见 + 定稿冻结 + 已送字节=实际字节
+        marker8 = f"marker={run_id}-t8"
+        seen_phases = set()
+
+        async def stream_and_observe_8():
+            total = 0
+            async with s.get(f"{GW}/quote-big?size=1048576&chunk_ms=100&{marker8}") as r:
+                async for chunk in r.content.iter_chunked(65536):
+                    total += len(chunk)
+            return total
+
+        task8 = asyncio.create_task(stream_and_observe_8())
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            payload = await get_diag(s)
+            d = find_diag(payload, marker8)
+            if d is not None and not d["ended"]:
+                seen_phases.add(d["phase"])
+            if task8.done():
+                break
+        total8 = await task8
+        d8, _ = await wait_diag(s, marker8)
+        check("8 在途可见等待阶段(wait_chunk/downstream)",
+              seen_phases & {"wait_chunk", "wait_downstream"}, str(seen_phases))
+        check("8 定稿原因 completed", d8["end_reason"] == "completed", d8["end_reason"])
+        check("8 状态码保留 200", d8["status_code"] == 200, str(d8["status_code"]))
+        check("8 已送字节=客户端实收字节", d8["bytes_sent"] == total8 == 1048576,
+              f"diag={d8['bytes_sent']} got={total8}")
+        snap1 = dict(d8)
+        await asyncio.sleep(2.3)  # 等影子比对结果落地更新
+        d8b, _ = await wait_diag(s, marker8)
+        check("8 影子结果更新不改写诊断", d8b == snap1, "snapshot changed after finalize")
+        check("8 三阶段计时非负且合计=总耗时",
+              d8b["wait_headers_ms"] >= 0 and d8b["wait_chunk_ms"] >= 0
+              and d8b["wait_downstream_ms"] >= 0
+              and d8b["total_ms"] == (d8b["wait_headers_ms"]
+                                      + d8b["wait_chunk_ms"]
+                                      + d8b["wait_downstream_ms"]))
+
+        # 9. 同一地址并发下载: 诊断逐条独立
+        marker9 = f"marker={run_id}-t9"
+        url9 = f"{GW}/quote-big?size=1048576&chunk_ms=200&{marker9}"
+        max_active = 0
+        ids9 = set()
+
+        async def one9(i):
+            async with aiohttp.ClientSession() as cs:
+                async with cs.get(url9) as r:
+                    n = 0
+                    async for chunk in r.content.iter_chunked(65536):
+                        n += len(chunk)
+                    return r.status, n
+
+        jobs = [asyncio.create_task(one9(i)) for i in range(3)]
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            payload = await get_diag(s)
+            active9 = [d for d in payload["active"] if marker9 in d["target"]]
+            max_active = max(max_active, len(active9))
+            ids9.update(d["id"] for d in active9)
+            if all(j.done() for j in jobs):
+                break
+        res9 = await asyncio.gather(*jobs)
+        payload9 = await get_diag(s)
+        done9 = [d for d in payload9["done"] if marker9 in d["target"]]
+        ids9.update(d["id"] for d in done9)
+        check("9 三请求全部200且字节完整",
+              all(st == 200 and n == 1048576 for st, n in res9))
+        check("9 在途曾出现>=2条独立诊断", max_active >= 2, f"max_active={max_active}")
+        check("9 三条诊断ID互不相同", len(ids9) == 3, str(ids9))
+        check("9 三条均定稿 completed",
+              len(done9) == 3 and all(d["end_reason"] == "completed" for d in done9),
+              f"done={len(done9)}")
+
+        # 10. 断连: 诊断在 wait_downstream 阶段定稿, 仅保留已写入字节且冻结
+        marker10 = f"marker={run_id}-t10"
+        try:
+            async with s.get(f"{GW}/quote-big?size=4194304&chunk_ms=80&{marker10}") as r:
+                got = 0
+                async for chunk in r.content.iter_chunked(65536):
+                    got += len(chunk)
+                    if got >= 3 * 65536:
+                        break
+        except Exception:
+            pass
+        d10 = None
+        for _ in range(40):
+            await asyncio.sleep(0.15)
+            d10 = find_diag(await get_diag(s), marker10)
+            if d10 is not None and d10["ended"]:
+                break
+        check("10 断连诊断已定稿", d10 is not None and d10["ended"])
+        if d10:
+            check("10 结束原因 client_disconnected",
+                  d10["end_reason"] == "client_disconnected", d10["end_reason"])
+            # 网关按"下游写入成功"计数: 客户端断连传播回来前, 块可能已写入
+            # 内核发送缓冲, 故已送字节 >= 客户端已读, 且必然小于完整响应
+            check("10 已送字节>0且未送完整(缓冲在途合理)",
+                  0 < d10["bytes_sent"] < 4 * 1024 * 1024
+                  and d10["bytes_sent"] >= got,
+                  f"sent={d10['bytes_sent']} got={got}")
+            snap10 = dict(d10)
+            await asyncio.sleep(0.6)
+            d10b = find_diag(await get_diag(s), marker10)
+            check("10 定稿后不再改写", d10b == snap10)
+
+        # 11. 响应头延迟: 在途诊断停在 wait_headers 且等待时间实时增长
+        marker11 = f"marker={run_id}-t11"
+        t11 = time.monotonic()
+
+        async def req11():
+            async with s.get(
+                    f"{GW}/quote-big?size=131072&p_delay=1.5&{marker11}") as r:
+                await r.read()
+                return r.status
+
+        task11 = asyncio.create_task(req11())
+        d11 = None
+        for _ in range(20):
+            await asyncio.sleep(0.12)
+            d11 = find_diag(await get_diag(s), marker11)
+            if d11 is not None and d11["phase"] == "wait_headers" \
+                    and d11["wait_headers_ms"] > 300:
+                break
+        status11 = await task11
+        if d11 is not None:
+            check("11 等头阶段实时计入等待",
+                  d11["phase"] == "wait_headers" and d11["wait_headers_ms"] >= 300,
+                  f"phase={d11['phase']} ms={d11['wait_headers_ms']}")
+        else:
+            check("11 等头阶段实时计入等待", False, "diag missing")
+        check("11 延迟响应头仍透传200", status11 == 200, str(status11))
+        d11f, _ = await wait_diag(s, marker11)
+        check("11 定稿等头耗时>=1.5s", d11f["wait_headers_ms"] >= 1500,
+              f"{d11f['wait_headers_ms']}ms (wall {time.monotonic()-t11:.2f}s)")
+
+        # 12. /quote 不产生大响应诊断
+        async with s.get(f"{GW}/quote?marker={run_id}-t12") as r:
+            await r.read()
+        await asyncio.sleep(0.4)
+        payload12 = await get_diag(s)
+        check("12 /quote 不进入大响应诊断",
+              find_diag(payload12, f"marker={run_id}-t12") is None)
 
     print(f"\n汇总: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

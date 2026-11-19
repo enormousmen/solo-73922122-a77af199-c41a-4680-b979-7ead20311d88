@@ -7,7 +7,7 @@
 - GET /healthz          健康检查
 
 可控参数 (query string 会被网关原样转发):
-- delay=<秒>            首字节前延迟 (两端各自生效)
+- delay=<秒>            响应头(首字节)前延迟 (两端各自生效); /quote-big 延迟发生在发响应头之前
 - p_delay / s_delay     仅主端 / 仅影子端生效的延迟
 - status=<码>           自定义 HTTP 状态码
 - fail=1                立即返回 500
@@ -113,9 +113,12 @@ async def quote_big(request: Request):
 
     shadow_diff = ROLE == "shadow" and q.get("diff") == "1"
 
+    # 在 StreamingResponse 构造之前睡眠: 响应头(首字节)本身延迟,
+    # 网关侧的"等主端响应头"诊断阶段能真实观察到这段等待
+    if delay:
+        await asyncio.sleep(delay)
+
     async def gen():
-        if delay:
-            await asyncio.sleep(delay)
         remaining = size
         index = 0
         while remaining > 0:

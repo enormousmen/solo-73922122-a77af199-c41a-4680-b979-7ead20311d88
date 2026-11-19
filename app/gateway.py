@@ -32,6 +32,18 @@ MAX_SHADOW_CALLS = int(os.environ.get("MAX_SHADOW_CALLS", "4"))
 SHADOW_TIMEOUT_S = float(os.environ.get("SHADOW_TIMEOUT_S", "2.0"))
 READ_CHUNK = 64 * 1024
 MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "100"))
+# /quote-big 逐请求诊断历史(在途 + 已定稿)的环形容量
+MAX_DIAG_RECORDS = int(os.environ.get("MAX_DIAG_RECORDS", "100"))
+
+# 大响应诊断的阶段名:
+#   wait_headers     网关正在等主端响应头
+#   wait_chunk       网关正在等主端下一块正文
+#   wait_downstream  网关正在等下游(客户端)写入完成
+#   done             主响应已正常结束或中断, 诊断定稿
+DIAG_WAIT_HEADERS = "wait_headers"
+DIAG_WAIT_CHUNK = "wait_chunk"
+DIAG_WAIT_DOWNSTREAM = "wait_downstream"
+DIAG_DONE = "done"
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -79,6 +91,93 @@ class CallContext:
     shadow_task: Optional[asyncio.Task] = None
 
 
+@dataclass
+class BigResponseDiag:
+    """
+    GET /quote-big 单请求诊断: 只保留状态、计时和计数, 不保存任何正文。
+
+    计时按网关实际读写划分三个阶段, 每段累计等待耗时; 查询时把当前
+    还在等待的时间也算入。已送字节仅在正文块向客户端写入成功后才累计。
+    定稿(finalize)后字段冻结, 后续影子比对结果更新不会改写诊断。
+    """
+    id: str
+    target: str
+    created_ms: int
+    t0: float
+    phase: str = DIAG_WAIT_HEADERS
+    phase_since: float = 0.0
+    # 三阶段累计耗时(ms), 不含当前阶段尚未结束的等待(查询时实时补算)
+    wait_headers_ms: int = 0
+    wait_chunk_ms: int = 0
+    wait_downstream_ms: int = 0
+    status_code: Optional[int] = None
+    chunks_sent: int = 0
+    bytes_sent: int = 0
+    ended: bool = False
+    end_reason: Optional[str] = None
+
+    def __post_init__(self):
+        self.phase_since = self.t0
+
+    def set_phase(self, phase: str) -> None:
+        """阶段切换: 先把刚结束阶段的实际等待累计入账, 再进入新阶段。"""
+        if self.ended or phase == self.phase:
+            return
+        elapsed = int((time.monotonic() - self.phase_since) * 1000)
+        if self.phase == DIAG_WAIT_HEADERS:
+            self.wait_headers_ms += elapsed
+        elif self.phase == DIAG_WAIT_CHUNK:
+            self.wait_chunk_ms += elapsed
+        elif self.phase == DIAG_WAIT_DOWNSTREAM:
+            self.wait_downstream_ms += elapsed
+        self.phase = phase
+        self.phase_since = time.monotonic()
+
+    def note_chunk_written(self, size: int) -> None:
+        """正文块向下游写入成功后才累计块数与已送字节。"""
+        self.chunks_sent += 1
+        self.bytes_sent += size
+
+    def finalize(self, reason: str, status_code: Optional[int] = None) -> None:
+        """主响应正常结束或中断时定稿; 幂等, 影子结果更新不得再改写。"""
+        if self.ended:
+            return
+        self.set_phase(DIAG_DONE)  # 收尾当前阶段累计
+        if status_code is not None:
+            self.status_code = status_code
+        self.end_reason = reason
+        self.ended = True
+
+    def snapshot(self) -> dict:
+        """查询视图: 未定稿时把当前仍在等待的时间实时算入。"""
+        wait_headers = self.wait_headers_ms
+        wait_chunk = self.wait_chunk_ms
+        wait_downstream = self.wait_downstream_ms
+        if not self.ended:
+            live = int((time.monotonic() - self.phase_since) * 1000)
+            if self.phase == DIAG_WAIT_HEADERS:
+                wait_headers += live
+            elif self.phase == DIAG_WAIT_CHUNK:
+                wait_chunk += live
+            elif self.phase == DIAG_WAIT_DOWNSTREAM:
+                wait_downstream += live
+        return {
+            "id": self.id,
+            "target": self.target,
+            "created_ms": self.created_ms,
+            "phase": self.phase,
+            "wait_headers_ms": wait_headers,
+            "wait_chunk_ms": wait_chunk,
+            "wait_downstream_ms": wait_downstream,
+            "total_ms": wait_headers + wait_chunk + wait_downstream,
+            "status_code": self.status_code,
+            "chunks_sent": self.chunks_sent,
+            "bytes_sent": self.bytes_sent,
+            "ended": self.ended,
+            "end_reason": self.end_reason,
+        }
+
+
 state: dict = {}
 # 后台影子任务的强引用集合: 防止生成器返回后 ctx 被回收导致任务被 GC 销毁,
 # 任务完成时通过 done_callback 自行移除
@@ -94,6 +193,10 @@ async def lifespan(app: FastAPI):
     state["limiter"] = ShadowLimiter()
     state["records"] = []
     state["records_lock"] = asyncio.Lock()
+    # /quote-big 逐请求诊断: 在途字典(rid -> BigResponseDiag) + 已定稿历史(新→旧)
+    state["diag_active"] = {}
+    state["diag_done"] = []
+    state["diag_lock"] = asyncio.Lock()
     try:
         yield
     finally:
@@ -113,6 +216,21 @@ async def append_record(rec: dict) -> None:
         recs.append(rec)
         if len(recs) > MAX_RECORDS:
             del recs[:-MAX_RECORDS]
+
+
+async def archive_diag(diag: BigResponseDiag, reason: str,
+                       status_code: Optional[int] = None) -> None:
+    """
+    主响应正常结束或中断时定稿诊断并从在途移入历史。
+    finalize 幂等; 定稿后只做归档, 任何后续更新(含影子比对)都不改写它。
+    """
+    diag.finalize(reason, status_code)
+    async with state["diag_lock"]:
+        state["diag_active"].pop(diag.id, None)
+        done = state["diag_done"]
+        done.insert(0, diag)
+        if len(done) > MAX_DIAG_RECORDS:
+            del done[MAX_DIAG_RECORDS:]
 
 
 def filtered_headers(resp: aiohttp.ClientResponse) -> dict[str, str]:
@@ -239,6 +357,13 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
     }
     ctx = CallContext(rid=rid, target=target, started_at=started, record=rec)
 
+    # /quote-big 逐请求诊断: 在途即可通过 /api/diag/quote-big 逐条查看
+    diag: Optional[BigResponseDiag] = None
+    if target.split("?", 1)[0] == "/quote-big":
+        diag = BigResponseDiag(
+            id=rid, target=target, created_ms=started, t0=time.monotonic())
+        state["diag_active"][rid] = diag
+
     # 先占影子名额(非阻塞); 满了直接跳过, 但主请求照常通过
     if await state["limiter"].acquire():
         rec["shadow"] = "started"
@@ -259,6 +384,9 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         rec["primary"] = f"connection error: {type(exc).__name__}"
         rec["result"] = "primary_error"
+        if diag is not None:
+            # 连主端响应头都没等到: 诊断在 wait_headers 阶段定稿
+            await archive_diag(diag, "primary_error")
         if ctx.shadow_task is not None:
             # 主端连接失败: 终止已发起的影子; 名额由任务自身在退出时归还
             ctx.shadow_task.cancel()
@@ -272,6 +400,11 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
             content={"detail": "primary quote service unavailable"},
         )
 
+    # 主端响应头已到: 诊断记录原状态码(仍逐块透传, 诊断不留正文)并进入等正文阶段
+    if diag is not None:
+        diag.status_code = primary_resp.status
+        diag.set_phase(DIAG_WAIT_CHUNK)
+
     async def body_iter():
         primary_hash = hashlib.sha256()
         try:
@@ -279,12 +412,22 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
                 if await request.is_disconnected():
                     raise asyncio.CancelledError
                 primary_hash.update(chunk)  # 流式哈希, 不缓存整份响应
+                # 从主端读到一块: 结束"等主端块", 进入"等下游写入"
+                if diag is not None:
+                    diag.set_phase(DIAG_WAIT_DOWNSTREAM)
                 yield chunk
+                # yield 正常返回 = 该块已成功写入下游, 此时才累计已送字节
+                if diag is not None:
+                    diag.note_chunk_written(len(chunk))
+                    diag.set_phase(DIAG_WAIT_CHUNK)
         except asyncio.CancelledError:
             # 客户端断连: 同时终止主端读取与影子调用
             rec["primary"] = "aborted before completion"
             rec["result"] = "client_disconnected"
             primary_resp.release()
+            if diag is not None:
+                await archive_diag(
+                    diag, "client_disconnected", primary_resp.status)
             if ctx.shadow_task is not None and not ctx.shadow_task.done():
                 ctx.shadow_task.cancel()
             if ctx.shadow_task is not None:
@@ -295,11 +438,14 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
                     pass
             await save_record(ctx)
             return
-        except aiohttp.ClientError as exc:
-            # 主端传输中途断开: 主响应不完整, 同样终止影子
+        except Exception as exc:
+            # 主端传输中途断开等: 主响应不完整, 同样终止影子
             rec["primary"] = f"stream error: {type(exc).__name__}"
             rec["result"] = "primary_incomplete"
             primary_resp.release()
+            if diag is not None:
+                await archive_diag(
+                    diag, "primary_incomplete", primary_resp.status)
             if ctx.shadow_task is not None and not ctx.shadow_task.done():
                 ctx.shadow_task.cancel()
             if ctx.shadow_task is not None:
@@ -309,23 +455,33 @@ async def proxy(request: Request, target: str) -> StreamingResponse:
                     pass
             await save_record(ctx)
             return
+        else:
+            # 主端完整结束: 客户端响应到此立刻收尾, 不等待影子
+            primary_resp.release()
+            if diag is not None:
+                # 定稿并保留已测耗时与已送字节; 后续影子结果更新不改写诊断
+                await archive_diag(diag, "completed", primary_resp.status)
+            ctx.primary_done = True
+            rec["primary_status"] = primary_resp.status
+            rec["primary_sha256"] = primary_hash.hexdigest()
+            rec["primary_ms"] = now_ms() - started
+            rec["primary"] = "completed"
 
-        # 主端完整结束: 客户端响应到此立刻收尾, 不等待影子
-        primary_resp.release()
-        ctx.primary_done = True
-        rec["primary_status"] = primary_resp.status
-        rec["primary_sha256"] = primary_hash.hexdigest()
-        rec["primary_ms"] = now_ms() - started
-        rec["primary"] = "completed"
+            if ctx.shadow_task is None:
+                # 名额满被跳过: 没有影子结果, 不产生一致性结论
+                await save_record(ctx)
+                return
 
-        if ctx.shadow_task is None:
-            # 名额满被跳过: 没有影子结果, 不产生一致性结论
+            # 主端响应到此完整结束并立即返回客户端, 不等待影子
+            finalize(rec, ctx)
+            # 影子仍在跑时先落 shadow_pending, 其退出后原地更新
             await save_record(ctx)
-            return
-
-        # 主端响应到此完整结束并立即返回客户端, 不等待影子
-        finalize(rec, ctx)
-        await save_record(ctx)  # 影子仍在跑时先落 shadow_pending, 其退出后原地更新
+        finally:
+            # 兜底: 任何未预期的中断都不能让诊断滞留在途; 已定稿则为幂等空操作
+            if diag is not None and not diag.ended:
+                await archive_diag(
+                    diag, "interrupted",
+                    primary_resp.status if primary_resp is not None else None)
 
     return StreamingResponse(
         body_iter(),
@@ -354,6 +510,26 @@ async def get_records():
         return list(reversed(state["records"]))
 
 
+@app.get("/api/diag/quote-big")
+async def get_quote_big_diag():
+    """
+    /quote-big 逐请求诊断: 同一地址的并发下载按 rid 逐条返回。
+    在途请求排在前面(查询时实时补算当前等待耗时), 其后为已定稿历史(新→旧)。
+    """
+    async with state["diag_lock"]:
+        active = list(state["diag_active"].values())
+        done = list(state["diag_done"])
+    active_snaps = [d.snapshot() for d in sorted(
+        active, key=lambda d: d.created_ms)]
+    done_snaps = [d.snapshot() for d in done]
+    return {
+        "active": active_snaps,
+        "done": done_snaps,
+        "active_count": len(active_snaps),
+        "done_count": len(done_snaps),
+    }
+
+
 @app.get("/api/state")
 async def get_state():
     lim: ShadowLimiter = state["limiter"]
@@ -362,6 +538,8 @@ async def get_state():
         "shadow_in_flight": lim.in_flight,
         "shadow_capacity": lim.capacity,
         "records": len(state["records"]),
+        "diag_active": len(state["diag_active"]),
+        "diag_done": len(state["diag_done"]),
         "max_rss_mib": round(rss_kb / 1024, 2),
     }
 

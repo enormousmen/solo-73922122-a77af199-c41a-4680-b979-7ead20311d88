@@ -56,6 +56,17 @@
   .pill.client_disconnected,.pill.primary_error,.pill.primary_incomplete,
   .pill.shadow_pending {
           background:#f1f5f9; color:#475569; }
+  .phase-pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          font-size:11px; font-weight:650; white-space:nowrap; }
+  .phase-wait_headers { background:#fef3c7; color:#b45309; }
+  .phase-wait_chunk { background:#e0e7ff; color:#3730a3; }
+  .phase-wait_downstream { background:#cffafe; color:#0e7490; }
+  .phase-done { background:#dcfce7; color:#15803d; }
+  .diag-wrap { max-height:300px; overflow:auto; }
+  tr.inflight td { background:#fffbeb; }
+  .demo-row { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .btn-demo { background:#f1f5f9; color:#334155; border:1px solid var(--bd); }
+  .btn-demo b { color:var(--pri); }
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
   .records-wrap { max-height:520px; overflow:auto; }
   .grid2 { display:grid; grid-template-rows:auto auto; gap:16px; }
@@ -99,6 +110,19 @@
         <input id="size" placeholder="默认 33554432">
       </div>
     </div>
+    <div class="row">
+      <div>
+        <label>慢分块 chunk_ms (仅 /quote-big)</label>
+        <input id="chunkms" placeholder="每块间隔毫秒, 默认 0">
+      </div>
+      <div></div>
+    </div>
+    <div class="demo-row">
+      <button class="btn-demo" id="demoHeader">演示① 延迟响应头
+        <b>p_delay=2</b></button>
+      <button class="btn-demo" id="demoSlow">演示② 慢分块
+        <b>chunk_ms=300</b></button>
+    </div>
     <div class="btns">
       <button class="btn-pri" id="fire">并发发起</button>
       <button class="btn-ghost" id="clear">清空面板</button>
@@ -131,6 +155,22 @@
         </table>
       </div>
     </div>
+    <div class="card">
+      <div class="poll-line">
+        <h2 style="margin:0">大响应诊断 · GET /quote-big 逐请求</h2>
+        <span class="hint" style="margin:0">在途请求实时计入当前等待，0.8s 刷新</span>
+      </div>
+      <div class="diag-wrap">
+        <table>
+          <thead><tr>
+            <th>请求 ID</th><th>阶段</th><th>等响应头 ms</th><th>等主端块 ms</th>
+            <th>等下游写 ms</th><th>状态码</th><th>已送块/字节</th><th>结束原因</th>
+          </tr></thead>
+          <tbody id="diags"><tr><td colspan="8" style="color:var(--mut)">
+            发起 /quote-big 下载后, 每个请求(含同地址并发)在此逐条显示…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -145,6 +185,8 @@ function buildUrl() {
   if ($('sdelay').value && Number($('sdelay').value) > 0) p.set('s_delay', $('sdelay').value);
   if ($('status').value) p.set('status', $('status').value);
   if ($('size').value) p.set('size', $('size').value);
+  if ($('chunkms').value && Number($('chunkms').value) > 0
+      && $('endpoint').value === '/quote-big') p.set('chunk_ms', $('chunkms').value);
   const sc = $('scenario').value;
   if (sc) new URLSearchParams(sc).forEach((v, k) => p.set(k, v));
   const qs = p.toString();
@@ -172,6 +214,7 @@ function renderChunks() {
   }
   const s = sessions[activeIdx];
   meta.innerHTML = `目标 <code class="path">${s.target}</code>
+    <span>诊断ID: <b class="mono">${s.diagId ?? '…'}</b></span>
     <span>状态: <b>${s.status ?? '…'}</b></span>
     <span>块数: <b>${s.chunks.length}</b></span>
     <span>累计字节: <b>${s.bytes}</b></span>
@@ -192,7 +235,7 @@ function escapeHtml(s) {
 }
 
 async function fireOne(target, idx) {
-  const sess = { idx, target, chunks: [], bytes: 0, status: null, ms: null };
+  const sess = { idx, target, chunks: [], bytes: 0, status: null, ms: null, diagId: null };
   sessions.push(sess);
   activeIdx = sessions.length - 1;
   renderTabs(); renderChunks();
@@ -216,14 +259,43 @@ async function fireOne(target, idx) {
   }
 }
 
+// 把刚发起的一批 /quote-big 会话与网关诊断 ID 关联(诊断按创建时间排序)
+async function linkDiagIds(firedSessions) {
+  if (!firedSessions.some(s => s.target.startsWith('/quote-big'))) return;
+  const before = new Set(sessions.map(s => s.diagId).filter(Boolean));
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let payload;
+    try {
+      payload = await (await fetch('/api/diag/quote-big')).json();
+    } catch (e) { break; }
+    const all = [...payload.active, ...payload.done];
+    const fresh = all.filter(d => !before.has(d.id));
+    const pending = firedSessions.filter(s => !s.diagId && s.target.startsWith('/quote-big'));
+    for (const s of pending) {
+      const hit = fresh.find(d => d.target === s.target
+        && !firedSessions.some(o => o !== s && o.diagId === d.id));
+      if (hit) s.diagId = hit.id;
+    }
+    if (pending.every(s => s.diagId)) break;
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+
 $('fire').onclick = async () => {
   const n = Math.max(1, Math.min(20, Number($('concurrency').value) || 1));
   const target = buildUrl();
   $('fire').disabled = true;
   const base = sessions.length;
-  await Promise.all(Array.from({ length: n }, (_, i) => fireOne(target, base + i)));
+  const batch = [];
+  const jobs = Array.from({ length: n }, (_, i) =>
+    fireOne(target, base + i).then(() => loadDiag()));
+  const fired = sessions.slice(base);
+  batch.push(...fired);
+  linkDiagIds(fired);
+  await Promise.all(jobs);
   $('fire').disabled = false;
   await loadRecords();
+  await loadDiag();
 };
 
 $('clear').onclick = () => {
@@ -274,6 +346,75 @@ async function loadRecords() {
 $('autopoll').onchange = () => {};
 setInterval(() => { if ($('autopoll').checked) loadRecords(); }, 1500);
 loadRecords();
+
+const PHASE_TEXT = {
+  wait_headers: '等主端响应头',
+  wait_chunk: '等主端下一块正文',
+  wait_downstream: '等下游写入完成',
+  done: '已定稿',
+};
+const END_TEXT = {
+  completed: '正常结束',
+  client_disconnected: '客户端断连中断',
+  primary_incomplete: '主端传输中断',
+  primary_error: '主端连接失败',
+  interrupted: '意外中断',
+};
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MiB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+  return n + ' B';
+}
+
+async function loadDiag() {
+  let payload;
+  try {
+    payload = await (await fetch('/api/diag/quote-big')).json();
+  } catch (e) { return; }
+  const rows = [...payload.active, ...payload.done];
+  const tbody = $('diags');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--mut)">暂无 /quote-big 诊断</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(d => `
+    <tr class="${d.ended ? '' : 'inflight'}">
+      <td><span class="mono">${escapeHtml(d.id)}</span><br>
+        <code class="path">${escapeHtml(d.target)}</code></td>
+      <td><span class="phase-pill phase-${d.phase}">${PHASE_TEXT[d.phase] || d.phase}</span></td>
+      <td class="mono">${d.wait_headers_ms}</td>
+      <td class="mono">${d.wait_chunk_ms}</td>
+      <td class="mono">${d.wait_downstream_ms}</td>
+      <td>${d.status_code ?? '—'}</td>
+      <td class="mono">${d.chunks_sent} 块 / ${fmtBytes(d.bytes_sent)}</td>
+      <td>${d.ended ? escapeHtml(END_TEXT[d.end_reason] || d.end_reason) : '—'}</td>
+    </tr>`).join('');
+}
+setInterval(loadDiag, 800);
+loadDiag();
+
+// 本地演示①: 主端延迟响应头 —— 诊断应停留在"等主端响应头"约 2 秒
+$('demoHeader').onclick = () => {
+  $('endpoint').value = '/quote-big';
+  $('pdelay').value = '2';
+  $('sdelay').value = '0';
+  $('chunkms').value = '';
+  $('size').value = '1048576';
+  $('concurrency').value = '2';
+  $('fire').click();
+};
+// 本地演示②: 慢分块 —— 诊断在"等主端块 / 等下游写"之间逐块推进, 字节逐块增长
+$('demoSlow').onclick = () => {
+  $('endpoint').value = '/quote-big';
+  $('pdelay').value = '0';
+  $('sdelay').value = '0';
+  $('chunkms').value = '300';
+  $('size').value = '2097152';
+  $('concurrency').value = '2';
+  $('fire').click();
+};
 </script>
 </body>
 </html>
